@@ -961,6 +961,22 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_REMAP {
+                        // Ours: the host slot of each view index
+                        // (`HeapCompact`).
+                        match self.remap_table(list) {
+                            // SAFETY: an open list; the list holds the table.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads view heap slots through a remap table the bound heap does not have"),
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
@@ -1254,6 +1270,24 @@ impl State {
             }
         }
         true
+    }
+
+    /// The GPU address of the bound view heap's remap table
+    /// (`victory_shader::emit::SLOT_REMAP`), held by `list`.
+    fn remap_table(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let (gpu, buffer) = heap.host()?.remap_table()?;
+        // The list may outlive the title's heap object, which owns the table.
+        const ONCE: usize = usize::MAX - 0x5f;
+        if list.first_use(ONCE) {
+            list.keep(buffer);
+        }
+        Some(gpu)
     }
 
     /// For a shader that picks buffers from the view heap by an index it

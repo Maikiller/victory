@@ -73,6 +73,10 @@ fn build() -> &'static [u8; 32] {
                     }
                     bytes.push(0);
                 }
+                // And the view heap's limit and remap table (HeapCompact).
+                let (limit, remap) = victory_shader::emit::view_heap_settings();
+                bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.push(u8::from(remap));
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()

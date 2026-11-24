@@ -124,6 +124,32 @@ pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether shaders translated with a [`VIEW_LIMIT`] read the host slot of
+/// a view index from the [`SLOT_REMAP`] table (`HeapCompact`: the title's
+/// slots share the capped host heap, given on use).
+static VIEW_REMAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// See [`VIEW_REMAP`].
+pub fn set_view_heap_remap(on: bool) {
+    VIEW_REMAP.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The translation settings of the view heap: its null slot (0: none) and
+/// whether indices go through [`SLOT_REMAP`] (part of the shader cache key).
+pub fn view_heap_settings() -> (u32, bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (VIEW_LIMIT.load(Relaxed), VIEW_REMAP.load(Relaxed))
+}
+
+/// The root SRV `t<SLOT_REMAP>` in [`ROOT_CBV_SPACE`] (with
+/// [`set_view_heap_remap`]): a raw buffer of [`SLOT_REMAP_COUNT`] dwords,
+/// dword `i` the host view-heap slot of view index `i` (a title slot, or a
+/// host-given index past them: dynamic slots), the null slot for none.
+/// Indices past it are clamped to its last dword (the null slot's).
+pub const SLOT_REMAP: u8 = 252;
+/// Dwords of the [`SLOT_REMAP`] buffer.
+pub const SLOT_REMAP_COUNT: u32 = 1 << 21;
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -400,6 +426,11 @@ impl Shader {
         let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
+            let index = if VIEW_REMAP.load(std::sync::atomic::Ordering::Relaxed) {
+                self.remapped(block, index)
+            } else {
+                index
+            };
             let null = self.m.i32(limit);
             let i32t = self.t.i32;
             let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
@@ -435,6 +466,33 @@ impl Shader {
             &[index, s, n],
         );
         self.annotate(block, h, props.0, props.1)
+    }
+
+    /// The host view-heap slot of view index `index`, from the
+    /// [`SLOT_REMAP`] table (the index clamped to it as `dx.op` UMin, as
+    /// the heap clamp is).
+    fn remapped(&mut self, block: usize, index: V) -> V {
+        let i32t = self.t.i32;
+        let last = self.m.i32(SLOT_REMAP_COUNT - 1);
+        let at = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        self.m.tag(at, super::bitcode::Tag::Clamp);
+        let two = self.m.i32(2);
+        let byte = self.m.bin(block, super::bitcode::Bin::Shl, at, two);
+        let h = self.root_srv_handle(SLOT_REMAP);
+        let iu = self.m.undef(i32t);
+        let mask = self.m.i8(1);
+        let align = self.m.i32(4);
+        let ret = self.t.res_ret;
+        let r = self.op(
+            block,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let f = self.m.extract(block, r, 0);
+        self.m.cast(block, super::bitcode::Cast::Bitcast, f, i32t)
     }
 
     /// The finished container.
