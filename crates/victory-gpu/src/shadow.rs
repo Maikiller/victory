@@ -2729,6 +2729,59 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     spans
 }
 
+/// A copy of its own of `[address, address + len)` for a buffer view the
+/// host cannot make on its buffer's copy (upstream 86a5ed6): a view that
+/// does not start on an element of that copy, or a raw or structured one
+/// not on 16 bytes (structured left structured reads zeros raw on NVIDIA).
+/// The title places such views at ring positions inside its big GPU heap
+/// (the meshlet culling's 456-byte constants, the colour bakes' parameter
+/// blocks); refused, their slots read zeros. The copy starts at the view's
+/// first byte, so its host view starts at 0. `VICTORY_VIEW_COPIES=0` turns
+/// this off.
+pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if len == 0 || !exact_on() {
+        return None;
+    }
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    *tick += 1;
+    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+        *used = *tick;
+        return Some(shadow.clone());
+    }
+    if map.len() >= EXACT_KEPT
+        && let Some(&oldest) = map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k)
+    {
+        map.remove(&oldest);
+    }
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    map.insert((address, len), (shadow.clone(), *tick));
+    EXACT_MADE.fetch_add(1, Ordering::Relaxed);
+    Some(shadow)
+}
+
+/// `VICTORY_VIEW_COPIES` (default on): [`exact`].
+pub(crate) fn exact_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_COPIES").is_none_or(|v| v != "0"))
+}
+
+/// Copies [`exact`] made so far.
+pub(crate) static EXACT_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// Copies of single views' bytes ([`exact`]) by (start, length), with the
+/// tick that last asked for each.
+#[allow(clippy::type_complexity)]
+static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+
+/// Copies [`EXACT`] keeps: ring positions change every frame, so the least
+/// recently asked for go (slots and lists using one keep it alive).
+const EXACT_KEPT: usize = 1024;
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
