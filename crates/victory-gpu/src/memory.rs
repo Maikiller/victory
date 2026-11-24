@@ -88,6 +88,8 @@ struct Memory {
     /// allocations shaders reached through pointers.
     prepped: u64,
     prepped_reached: u64,
+    /// Bytes the prep numbered that are title memory in place.
+    prepped_in_place: u64,
     /// Frames in which shaders read title memory by address.
     frames: u64,
 }
@@ -204,6 +206,7 @@ impl Memory {
             missed: (0, 0, u64::MAX, 0),
             prepped: 0,
             prepped_reached: 0,
+            prepped_in_place: 0,
             frames: 0,
         })
     }
@@ -453,7 +456,10 @@ impl Memory {
             if !(covered && at >= lo && at + CELL <= hi) {
                 let n = self.copies.len();
                 self.map(at.max(base));
-                let bytes = self.copies[n..].iter().map(|c| c.span().1).sum::<u64>();
+                // Title memory in place (VICTORY_INPLACE) is no copy: it costs
+                // no host memory and counts apart, not against the bounds.
+                let bytes = self.copies[n..].iter().filter(|c| !c.in_place()).map(|c| c.span().1).sum::<u64>();
+                self.prepped_in_place += self.copies[n..].iter().filter(|c| c.in_place()).map(|c| c.span().1).sum::<u64>();
                 if reached {
                     self.prepped_reached += bytes;
                 } else {
@@ -470,9 +476,12 @@ impl Memory {
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
                 tracing::info!(
-                    "bvh prep: allocation at {base:#x} ({:.1} MB) ready from {lo:#x} to {hi:#x}, {made} copies more ({} numbered)",
+                    "bvh prep: allocation at {base:#x} ({:.1} MB) ready from {lo:#x} to {hi:#x}, {made} copies more ({} numbered); prepped so far: {} MB copied for named addresses, {} MB for reached allocations, {} MB in place (no copy)",
                     (end - base) as f64 / 1e6,
-                    self.copies.len()
+                    self.copies.len(),
+                    self.prepped >> 20,
+                    self.prepped_reached >> 20,
+                    self.prepped_in_place >> 20
                 );
             }
         }
