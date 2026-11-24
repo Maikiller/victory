@@ -71,6 +71,9 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// Numbered for shaders that read title memory by address
+    /// (`crate::memory`): its copy-back bytes are counted ([`BY_ADDRESS_BACK`]).
+    pub(crate) by_address: std::sync::atomic::AtomicBool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -1717,6 +1720,7 @@ impl Shadow {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
             },
+            by_address: std::sync::atomic::AtomicBool::new(false),
             card: None,
             window: false,
             place: None,
@@ -1962,7 +1966,16 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
+        if self.by_address.load(Ordering::Relaxed) {
+            BY_ADDRESS_BACK.fetch_add(written as u64, Ordering::Relaxed);
+        }
         written
+    }
+
+    /// Whether the copy is title memory itself (`crate::inplace`): shaders
+    /// write the title's bytes, nothing is copied back.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
     }
 
     /// Offsets `[from, to)` of the copy are compared with the snapshot: for
@@ -2781,6 +2794,10 @@ static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::ne
 /// Copies [`EXACT`] keeps: ring positions change every frame, so the least
 /// recently asked for go (slots and lists using one keep it alive).
 const EXACT_KEPT: usize = 1024;
+
+/// Bytes copied back to title memory from copies numbered for shaders that
+/// read title memory by address (the ray-tracing structure builder).
+pub(crate) static BY_ADDRESS_BACK: AtomicU64 = AtomicU64::new(0);
 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length

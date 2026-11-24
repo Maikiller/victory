@@ -103,6 +103,20 @@ fn prep() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_PREP").is_some_and(|v| v == "1"))
 }
 
+fn watch() -> &'static [u64] {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_BVH_WATCH")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                u64::from_str_radix(s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s), 16).ok()
+            })
+            .collect()
+    })
+}
+
 fn prep_bytes() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -209,6 +223,7 @@ impl Memory {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(shadow.clone());
+                shadow.by_address.store(true, std::sync::atomic::Ordering::Relaxed);
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
@@ -290,6 +305,35 @@ impl Memory {
                 tracing::warn!(
                     "bvh raw: {reads} reads/{stores} stores missed (pages without a copy, over {frames} frames), first at {first:#x}"
                 );
+            }
+            let back = crate::shadow::BY_ADDRESS_BACK.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let in_place = self.copies.iter().filter(|c| c.in_place()).count();
+            if !self.copies.is_empty() {
+                tracing::info!(
+                    "bvh raw: {} copies numbered ({in_place} in place, written straight to title memory); {:.1} KB/frame copied back to title memory from the others",
+                    self.copies.len(),
+                    back as f64 / frames as f64 / 1e3
+                );
+            }
+            // VICTORY_BVH_WATCH=0x<va>[,...]: whether the page of each
+            // address (where the title's CPU reads nodes) has a copy.
+            for &va in watch() {
+                let page = va / PAGE;
+                let n = if page < u64::from(MEMORY_PAGES) - 1 {
+                    // SAFETY: inside the directory's mapping.
+                    unsafe { self.directory.1.add(page as usize * 2).read() }
+                } else {
+                    0
+                };
+                let what = match n {
+                    0 => "NO copy (shaders read 0 and drop stores there)".to_owned(),
+                    n => match self.copies.get(n as usize - 1) {
+                        Some(c) if c.in_place() => format!("copy {n}, in place"),
+                        Some(c) => format!("copy {n} at {:#x}+{:#x}, copied back", c.span().0, c.span().1),
+                        None => format!("copy {n}?"),
+                    },
+                };
+                tracing::info!("bvh watch {va:#x}: {what}");
             }
             self.missed = (0, 0, u64::MAX, 0);
         }
