@@ -5578,7 +5578,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            return Err("a descriptor read only as data");
+            return self.descriptor_data_unused(inst, code, count, site);
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -5630,7 +5630,29 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        self.descriptor_words(inst, code, count, site, &src, first, uav, props, image, used)
+    }
+
+    /// The descriptor words [`Lower::descriptor_data`] gives the `count`
+    /// SGPRs from `code` a load at `site` fills, from the host view of
+    /// `src` (from dword `first`): an image's sizes (`image`: its DXIL
+    /// kind) or a buffer's record count; the other dwords read as
+    /// [`OTHER`](Lower::descriptor_data).
+    #[allow(clippy::too_many_arguments)]
+    fn descriptor_words(
+        &mut self,
+        inst: &Inst,
+        code: u8,
+        count: u32,
+        site: Site,
+        src: &Source,
+        first: u8,
+        uav: bool,
+        props: (u32, u32),
+        image: Option<u32>,
+        used: Option<&UsedResource>,
+    ) -> Result<(), Why> {
+        let h = self.handle(site, src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -5645,39 +5667,7 @@ impl<'a> Lower<'a> {
         let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
         let words: Vec<(u32, V)> = match image {
             Some(kind) => {
-                let one = self.s.m.i32(1);
-                let w = field(self, 0);
-                let (height, depth) = match kind {
-                    1 => (one, one),
-                    2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
-                    _ => (field(self, 1), field(self, 2)),
-                };
-                let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
-                let (w, height, depth, levels) = (
-                    less(self, w),
-                    less(self, height),
-                    less(self, depth),
-                    less(self, levels),
-                );
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k30, k2, k14, k16, mask) = (
-                    k(self, 30),
-                    k(self, 2),
-                    k(self, 14),
-                    k(self, 16),
-                    k(self, 0x3FFF),
-                );
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
-                let hi = self.s.m.bin(c, Bin::LShr, w, k2);
-                let hi = self.s.m.bin(c, Bin::And, hi, mask);
-                let ht = self.s.m.bin(c, Bin::Shl, height, k14);
-                let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
-                let base = k(self, 0xFAC | ty << 28);
-                let last = self.s.m.bin(c, Bin::Shl, levels, k16);
-                let d3 = self.s.m.bin(c, Bin::Or, base, last);
+                let [d1, d2, d3, depth] = self.image_words_of(d, kind, uav);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
             None => {
@@ -5706,6 +5696,66 @@ impl<'a> Lower<'a> {
                 words
             }
         };
+        self.write_descriptor_words(inst, code, count, first, &words);
+        Ok(())
+    }
+
+    /// Dwords 1-4 of the console image descriptor of DXIL resource kind
+    /// `kind` (UAV: `uav`) whose host view `h` (its sizes at level 0).
+    fn image_words(&mut self, h: V, kind: u32, uav: bool) -> [V; 4] {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let mip = if uav { self.s.m.undef(i32t) } else { self.s.m.i32(0) };
+        let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        self.image_words_of(d, kind, uav)
+    }
+
+    /// [`Lower::image_words`] from the `getDimensions` result `d`.
+    fn image_words_of(&mut self, d: V, kind: u32, uav: bool) -> [V; 4] {
+        let c = self.cur;
+        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
+        let one = self.s.m.i32(1);
+        let w = field(self, 0);
+        let (height, depth) = match kind {
+            1 => (one, one),
+            2 => (field(self, 1), one),
+            6 => (one, field(self, 1)),
+            _ => (field(self, 1), field(self, 2)),
+        };
+        let levels = if uav { one } else { field(self, 3) };
+        let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
+        let (w, height, depth, levels) = (
+            less(self, w),
+            less(self, height),
+            less(self, depth),
+            less(self, levels),
+        );
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k30, k2, k14, k16, mask) = (
+            k(self, 30),
+            k(self, 2),
+            k(self, 14),
+            k(self, 16),
+            k(self, 0x3FFF),
+        );
+        let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+        let hi = self.s.m.bin(c, Bin::LShr, w, k2);
+        let hi = self.s.m.bin(c, Bin::And, hi, mask);
+        let ht = self.s.m.bin(c, Bin::Shl, height, k14);
+        let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
+        let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+        let base = k(self, 0xFAC | ty << 28);
+        let last = self.s.m.bin(c, Bin::Shl, levels, k16);
+        let d3 = self.s.m.bin(c, Bin::Or, base, last);
+        [d1, d2, d3, depth]
+    }
+
+    /// Writes `words` (dword of the descriptor, value) to the `count` SGPRs
+    /// from `code` a load of the descriptor from dword `first` fills; the
+    /// dwords they do not give read as no value (an address or format).
+    fn write_descriptor_words(&mut self, inst: &Inst, code: u8, count: u32, first: u8, words: &[(u32, V)]) {
+        const OTHER: Why = "a descriptor's address or format read as data";
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
@@ -5718,6 +5768,106 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+    }
+
+    /// [`Lower::descriptor_data`] of a descriptor nothing uses, only reads
+    /// as numbers (a ray-tracing resolve reads an image's size so): its
+    /// kind from the used-resource entry of its table, and with none (a
+    /// slot of the heap a computed index picks) an image if it is eight
+    /// dwords: with `VICTORY_INFER_IMAGE_2D` (the default) a 2D texture,
+    /// with `=0` the kind of the view in the slot at run time (the host's
+    /// table of strides marks a texture view's dimension,
+    /// [`super::shader::SLOT_IMAGE`]).
+    /// shortcut: with the default, an array, 3D or cube view read this way
+    /// gets 2D sizes.
+    fn descriptor_data_unused(&mut self, inst: &Inst, code: u8, count: u32, site: Site) -> Result<(), Why> {
+        const NONE: Why = "a descriptor read only as data";
+        let src = Source::Loaded { load: site, first: 0 };
+        let used = self.used_kind(&src);
+        let in_views = self
+            .scalar
+            .get(&site)
+            .and_then(|a| self.x.native.layout.get(a.param))
+            .is_some_and(|rp| matches!(rp.root, RootType::Table | RootType::ResourceHeap));
+        let (uav, dwords, stride) = match used {
+            Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav) => {
+                (u.kind == ResourceType::Uav, u32::from(u.dwords), u.stride)
+            }
+            Some(u) if u.kind == ResourceType::Cbv => {
+                self.stale.extend(inst.writes.iter().map(|w| w.1));
+                return Err("a constant buffer's descriptor read as data");
+            }
+            None if in_views => (false, count, 0),
+            _ => return Err(NONE),
+        };
+        let u = if uav { 0x1000 } else { 0 };
+        let (props, image) = match dwords {
+            8 if used.is_none() && !super::infer_image_2d() => {
+                return self.descriptor_data_by_kind(inst, code, count, site, &src);
+            }
+            8.. => ((2 | u, 0x409), Some(2)),
+            4 if stride >= 4 && stride.is_multiple_of(4) => ((12 | u, stride), None),
+            4 if used.is_some() => ((11 | u, 0), None),
+            _ => return Err(NONE),
+        };
+        self.descriptor_words(inst, code, count, site, &src, 0, uav, props, image, used)
+    }
+
+    /// [`Lower::descriptor_data_unused`] of an image no used-resource entry
+    /// names, by the kind of the view in its slot (`VICTORY_INFER_IMAGE_2D=0`):
+    /// the host's table of strides holds [`super::shader::SLOT_IMAGE`] with
+    /// the D3D12 view dimension for a texture shader resource view. The
+    /// program sizes the slot through a handle of each kind, each in a
+    /// branch only lanes whose slot holds that kind take, and keeps the
+    /// sizes of the kind it holds (zeros for none of them).
+    fn descriptor_data_by_kind(
+        &mut self,
+        inst: &Inst,
+        code: u8,
+        count: u32,
+        site: Site,
+        src: &Source,
+    ) -> Result<(), Why> {
+        let Source::Loaded { load, first } = *src else {
+            unreachable!()
+        };
+        let slot = self.heap_index(load, first, false)?;
+        let c = self.cur;
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let at = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(at, Tag::Clamp);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, at, two);
+        // The table through its own root view: it is not the one that has
+        // the host make every buffer view of the heap ready.
+        let table = self.s.root_srv_handle(super::shader::SLOT_VIEW_WORDS);
+        let iu = self.s.m.undef(i32t);
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, byte, iu, mask, align],
+        );
+        let word = self.s.m.extract(c, r, 0);
+        let word = self.as_int(word);
+        let zero = self.s.m.i32(0);
+        let mut got: Vec<V> = (0..4).map(|_| zero).collect();
+        for &(dim, kind) in super::shader::IMAGE_KINDS {
+            let mark = self.s.m.i32(super::shader::SLOT_IMAGE | dim);
+            let c = self.cur;
+            let hit = self.s.m.cmp(c, pred::EQ, word, mark);
+            let at = self.begin_guarded(Some(hit));
+            let h = self.handle(site, src, false, (kind, 0x409))?;
+            let words = self.image_words(h, kind, false);
+            let pairs: Vec<(V, V)> = words.iter().zip(&got).map(|(&w, &g)| (w, g)).collect();
+            got = self.end_guarded(at, &pairs);
+        }
+        let words: Vec<(u32, V)> = (1..=4).zip(got).collect();
+        self.write_descriptor_words(inst, code, count, first, &words);
         Ok(())
     }
 
@@ -6195,6 +6345,12 @@ impl<'a> Lower<'a> {
         );
         let f = self.s.m.extract(c, r, 0);
         let v = self.as_int(f);
+        // A texture view's word (`VICTORY_INFER_IMAGE_2D=0`) is no stride.
+        let bit = self.s.m.i32(super::shader::SLOT_IMAGE);
+        let marked = self.s.m.bin(c, Bin::And, v, bit);
+        let zero = self.s.m.i32(0);
+        let image = self.s.m.cmp(c, pred::NE, marked, zero);
+        let v = self.s.m.select(c, image, zero, v);
         self.strides.insert(key, v);
         Ok(Some(v))
     }

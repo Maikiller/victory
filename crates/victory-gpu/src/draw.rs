@@ -961,6 +961,22 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_WORDS {
+                        // Ours: the table of strides by slot, without making
+                        // the heap's buffer views ready.
+                        match self.view_words(list) {
+                            // SAFETY: an open list; the list holds the table.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads view heap slots' words without a view heap"),
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_REMAP {
                         // Ours: the host slot of each view index
                         // (`HeapCompact`).
@@ -1270,6 +1286,26 @@ impl State {
             }
         }
         true
+    }
+
+    /// The GPU address of the bound view heap's table of strides by slot,
+    /// held by `list` (`victory_shader::emit::SLOT_VIEW_WORDS`).
+    fn view_words(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.strides_gpu()?;
+        const ONCE: usize = usize::MAX - 0x60;
+        if list.first_use(ONCE)
+            && let Some(buffer) = host.strides_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
     }
 
     /// The GPU address of the bound view heap's remap table

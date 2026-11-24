@@ -26,6 +26,25 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The [`SLOT_STRIDES`] table as `t<SLOT_VIEW_WORDS>`, for a shader that
+/// reads a slot's word without picking buffers from the heap (so the host
+/// does not make every buffer view of the heap ready for it).
+pub const SLOT_VIEW_WORDS: u8 = 251;
+/// A texture shader resource view's word in the [`SLOT_STRIDES`] table
+/// (`VICTORY_INFER_IMAGE_2D=0`): this bit with its D3D12 view dimension.
+pub const SLOT_IMAGE: u32 = 1 << 31;
+/// The texture view dimensions [`SLOT_IMAGE`] names (D3D12 SRV dimension,
+/// DXIL resource kind): 1D, 1D array, 2D, 2D array, 3D.
+pub const IMAGE_KINDS: &[(u32, u32)] = &[(2, 1), (3, 6), (4, 2), (5, 7), (8, 4)];
+
+/// `VICTORY_INFER_IMAGE_2D`: `1` (the default) takes a descriptor read only
+/// as data with no used-resource entry and eight dwords for a 2D texture;
+/// `0` takes the kind of the view in its slot at run time ([`SLOT_IMAGE`]).
+/// Part of the shader cache's key.
+pub fn infer_image_2d() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INFER_IMAGE_2D").map_or(true, |v| v.trim() != "0"))
+}
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

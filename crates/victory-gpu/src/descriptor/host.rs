@@ -463,6 +463,20 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
+/// The D3D12 view dimension of the texture shader resource view `view`
+/// when it is one of [`victory_shader::emit::IMAGE_KINDS`].
+/// shortcut: a view without a description (the texture's own) is not
+/// marked, and reads zero sizes this way.
+fn image_dimension(view: &View) -> Option<u32> {
+    const BUFFER: u32 = 1;
+    let dim = match view {
+        View::Shader(_, Some(d)) if d[1] != BUFFER => d[1],
+        View::Placed(false, resource, d) if resource[0] != BUFFER => d[1],
+        _ => return None,
+    };
+    victory_shader::emit::IMAGE_KINDS.iter().any(|&(d, _)| d == dim).then_some(dim)
+}
+
 fn view_stride(view: &View) -> Option<u32> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
@@ -1259,12 +1273,24 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
+        // (`VICTORY_INFER_IMAGE_2D=0`) A texture shader resource view's
+        // dimension, for shaders that size a slot whose kind they do not
+        // know.
+        let image = if victory_shader::emit::infer_image_2d() {
+            None
+        } else {
+            view.and_then(image_dimension)
+        };
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            unsafe {
+                (*data as *mut u32)
+                    .add(index as usize)
+                    .write_volatile(image.map_or(stride.unwrap_or(0), |d| victory_shader::emit::SLOT_IMAGE | d))
+            };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
