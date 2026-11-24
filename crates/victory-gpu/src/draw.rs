@@ -848,6 +848,9 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // What an operation dropped before its line noted is not this one's.
+        #[cfg(feature = "diagnostics")]
+        let _ = crate::capture::take_writes();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -1794,7 +1797,7 @@ impl State {
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return kind;
+            return kind + &crate::capture::take_writes();
         };
         let mut text = format!("{kind} {}", p.name);
         // What it draws into (a dispatch writes through its views below).
@@ -1806,6 +1809,11 @@ impl State {
                     format!("{t:#x} {}x{} f{}", d.Width, d.Height, d.Format.0)
                 })
             };
+            for &t in self.targets.iter().chain([&self.depth]) {
+                if crate::capture::watched(t) {
+                    crate::capture::note_write(t as This);
+                }
+            }
             let targets: Vec<String> = self.targets.iter().filter_map(|&t| described(t)).collect();
             let _ = write!(text, " targets {targets:?} depth {:?} state [{}]", described(self.depth), p.state);
             // The title's scissor and viewport at this draw (the first of
@@ -1839,6 +1847,14 @@ impl State {
                 if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
+                // A heap index naming an unordered view of a watched resource.
+                if self.heaps[0] != 0
+                    && let Some(View::Unordered(r, ..)) = crate::descriptor::heap(self.heaps[0] as This)
+                        .handle(index)
+                        .and_then(crate::descriptor::view)
+                {
+                    crate::capture::note_write(r as This);
+                }
             }
             for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
@@ -1849,6 +1865,7 @@ impl State {
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
+        text.push_str(&crate::capture::take_writes());
         text
     }
 
@@ -2679,7 +2696,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
+            {
+                crate::capture::note_target(*resource as This);
+                crate::capture::note_write(*resource as This);
+            }
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

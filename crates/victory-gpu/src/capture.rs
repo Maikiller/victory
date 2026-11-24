@@ -345,6 +345,63 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_PRODUCERS=0x<resource>[,0x<resource>...]`: title resources
+/// (as the target dump names them) whose writers the frame listing marks:
+/// a draw that renders to one, or a draw or dispatch that binds an
+/// unordered view of one (through a table, a heap index in its user data
+/// or a picked heap slot), gets `<<WRITES 0x..>>` on its line of
+/// `frame-<n>-ops.txt`. Copies into one are on their own lines already.
+fn producers() -> &'static [usize] {
+    static LIST: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_PRODUCERS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                usize::from_str_radix(s, 16).ok()
+            })
+            .collect()
+    })
+}
+
+thread_local! {
+    /// The watched resources the operation being bound writes.
+    static WRITES: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Notes that the operation being bound writes `resource`, if it is one
+/// of [`producers`].
+pub(crate) fn note_write(resource: crate::object::This) {
+    let r = resource as usize;
+    if producers().contains(&r) {
+        WRITES.with(|w| {
+            let mut w = w.borrow_mut();
+            if !w.contains(&r) {
+                w.push(r);
+            }
+        });
+    }
+}
+
+/// Whether `resource` is watched ([`producers`]).
+pub(crate) fn watched(resource: usize) -> bool {
+    producers().contains(&resource)
+}
+
+/// The marker for the operation's line, and forgets what it noted.
+pub(crate) fn take_writes() -> String {
+    WRITES.with(|w| {
+        let w = std::mem::take(&mut *w.borrow_mut());
+        if w.is_empty() {
+            String::new()
+        } else {
+            format!(" <<WRITES {}>>", w.iter().map(|r| format!("{r:#x}")).collect::<Vec<_>>().join(","))
+        }
+    })
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
