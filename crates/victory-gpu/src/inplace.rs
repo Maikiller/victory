@@ -139,8 +139,15 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
+    let covered = cover(start as usize, len as usize);
+    if covered != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);
+        let kind = match covered {
+            Cover::Holes => "view memory (views over part of it)",
+            Cover::Scattered => "view memory (scattered views)",
+            _ => "view memory (one run of a section)",
+        };
+        turned(kind, start, len, || format!("{covered:?}"));
         return None;
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
@@ -157,6 +164,10 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
         Err(None) => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
+            let at = (start & !(K64 as u64 - 1)) as usize;
+            let bytes = ((start + len.max(1)).next_multiple_of(K64 as u64)) as usize - at;
+            let (kind, details) = why_not_whole(at, bytes);
+            turned(kind, start, len, || details);
             None
         }
         Err(Some(e)) => {
@@ -210,6 +221,15 @@ fn say() {
         s[6],
         s[7]
     );
+    let mut kinds: Vec<(&'static str, (u64, u64, u64, String))> =
+        TURNED.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (*k, v.clone())).collect();
+    kinds.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+    for (kind, (n, bytes, first, details)) in kinds.into_iter().take(5) {
+        tracing::info!(
+            "title memory not in place: {kind}: {n} asks, {} MB; first at {first:#x} ({details})",
+            bytes >> 20
+        );
+    }
 }
 
 /// What a heap is opened on.
@@ -348,6 +368,46 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
 /// walks the page tables to the end of the pages that share the first
 /// one's state: a millisecond in the title's big blocks, so ask when a
 /// copy is made, not when it is used).
+/// Why [`private_whole`] turns `[at, at + len)` down (diagnostics): the
+/// kind of reason (for the tally) and its details.
+fn why_not_whole(at: usize, len: usize) -> (&'static str, String) {
+    // SAFETY: plain data filled in by the query.
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        return ("not asked", String::new());
+    }
+    let run_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+    let details = format!(
+        "allocation {:#x}, run {:#x}+{:#x}, state {:#x} type {:#x} protect {:#x}",
+        info.AllocationBase as usize, info.BaseAddress as usize, info.RegionSize, info.State, info.Type, info.Protect
+    );
+    let kind = if info.State != mem::MEM_COMMIT {
+        "first page not committed"
+    } else if info.Type != mem::MEM_PRIVATE {
+        "not private (mapped or image)"
+    } else if info.Protect != mem::PAGE_READWRITE {
+        "not read-write"
+    } else if run_end < at.saturating_add(len) {
+        "committed part ends inside"
+    } else {
+        "?"
+    };
+    (kind, details)
+}
+
+/// Turned-down asks by kind: how many, bytes, the first address and its
+/// details ([`why_not_whole`]); the five biggest go in the line of [`say`].
+static TURNED: Mutex<BTreeMap<&'static str, (u64, u64, u64, String)>> = Mutex::new(BTreeMap::new());
+
+fn turned(kind: &'static str, at: u64, len: u64, details: impl FnOnce() -> String) {
+    let mut t = TURNED.lock().unwrap_or_else(|e| e.into_inner());
+    let e = t.entry(kind).or_insert_with(|| (0, 0, at, details()));
+    e.0 += 1;
+    e.1 += len;
+}
+
 pub(crate) fn private_whole(at: usize, len: usize) -> bool {
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
