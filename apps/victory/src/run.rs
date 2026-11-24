@@ -66,6 +66,20 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
+    // VICTORY_CONSOLE=series-s|lockhart|series-x|anaconda|scarlett over
+    // `--console` (for launchers that only set the environment).
+    let console = match std::env::var("VICTORY_CONSOLE")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Ok("series-s" | "seriess" | "s" | "lockhart") => Console::SeriesS,
+        Ok("series-x" | "seriesx" | "x" | "anaconda" | "scarlett") => Console::SeriesX,
+        Ok(other) => {
+            eprintln!("VICTORY_CONSOLE={other} not understood; --console kept");
+            console
+        }
+        Err(_) => console,
+    };
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,
         Console::SeriesS => victory_hle::console::Console::SeriesS,
