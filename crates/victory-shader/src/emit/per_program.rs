@@ -46,7 +46,7 @@ pub fn for_program<T>(hash: &str, f: impl FnOnce() -> T) -> T {
 }
 
 /// The hash [`for_program`] set on this thread, if any.
-pub(super) fn current() -> Option<String> {
+pub(crate) fn current() -> Option<String> {
     PROGRAM.with_borrow(Clone::clone)
 }
 

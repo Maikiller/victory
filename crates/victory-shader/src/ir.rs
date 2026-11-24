@@ -289,7 +289,7 @@ fn unspill(
     for inst in list.iter() {
         let Some(name) = inst.name() else {
             if why {
-                eprintln!("UNSPILL off: an undecoded instruction at {:#x}", inst.offset);
+                eprintln!("UNSPILL #{} off: an undecoded instruction at {:#x}", crate::emit::per_program::current().as_deref().unwrap_or("?"), inst.offset);
             }
             return Vec::new();
         };
@@ -297,7 +297,7 @@ fn unspill(
         let park = parked(inst, &fields);
         let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
             if why {
-                eprintln!("UNSPILL off: effects unknown of {name} at {:#x}", inst.offset);
+                eprintln!("UNSPILL #{} off: effects unknown of {name} at {:#x}", crate::emit::per_program::current().as_deref().unwrap_or("?"), inst.offset);
             }
             return Vec::new();
         };
@@ -348,7 +348,7 @@ fn unspill(
             if other[r] && !told[r] {
                 told[r] = true;
                 let (at, by) = first_other[r].clone().unwrap_or_default();
-                eprintln!("UNSPILL v{r} kept: also used by {by} at {at:#x} (lanes follow EXEC)");
+                eprintln!("UNSPILL #{} v{r} kept: also used by {by} at {at:#x} (lanes follow EXEC)", crate::emit::per_program::current().as_deref().unwrap_or("?"));
             }
         }
     }
@@ -446,7 +446,7 @@ fn unspill(
         // Not enough spare codes: leave the program as it is.
         let Some(c) = at else {
             if why {
-                eprintln!("UNSPILL off: no spare codes for {} parked pairs", pairs.len());
+                eprintln!("UNSPILL #{} off: no spare codes for {} parked pairs", crate::emit::per_program::current().as_deref().unwrap_or("?"), pairs.len());
             }
             return Vec::new();
         };
@@ -460,7 +460,7 @@ fn unspill(
         }
         let Some(c) = (108..=123).chain((0..105).rev()).chain(past..255).find(|&c| free[c]) else {
             if why {
-                eprintln!("UNSPILL off: no spare code for {} parked lanes", slots.len());
+                eprintln!("UNSPILL #{} off: no spare code for {} parked lanes", crate::emit::per_program::current().as_deref().unwrap_or("?"), slots.len());
             }
             return Vec::new();
         };

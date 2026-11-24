@@ -92,7 +92,7 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 mod own_bits;
-mod per_program;
+pub(crate) mod per_program;
 mod rect;
 mod sampler;
 mod shader;
