@@ -77,20 +77,23 @@ struct Memory {
     refused: std::collections::HashSet<u64>,
     /// (`VICTORY_BVH_PREP=1`) Title allocations whose extent has been
     /// mapped whole, by their first byte.
-    allocations: std::collections::HashSet<u64>,
+    allocations: std::collections::BTreeMap<u64, (u64, u64, u64)>,
     /// (`VICTORY_BVH_PREP=1`) Per host list (by address): how many copies
     /// were numbered when it last brought them up to date.
     seen: HashMap<usize, usize>,
     /// Lost reads and lost stores (pages, as noted) since the last log,
     /// the first page and the frames counted.
     missed: (u64, u64, u64, u64),
+    /// Bytes of the copies the prep numbered.
+    prepped: u64,
 }
 
 /// `VICTORY_BVH_PREP=1`: before a dispatch that reads title memory by
 /// address (the ray-tracing structure builder, the traces):
 /// - a named address or a faulted page gets the copies of the whole title
 ///   allocation around it ([`allocation`], at most `VICTORY_BVH_PREP_MB`,
-///   default 256, from the address on), not only its 4 MiB: what a stage
+///   default 256, centred on the address; all made ready by it together at
+///   most `VICTORY_BVH_PREP_TOTAL_MB`, default 1024), not only its 4 MiB: what a stage
 ///   reaches through pointers it reads out of memory is mostly in the same
 ///   allocation as what it was given;
 /// - every copy numbered since the list last brought them up to date
@@ -114,6 +117,16 @@ fn watch() -> &'static [u64] {
                 u64::from_str_radix(s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s), 16).ok()
             })
             .collect()
+    })
+}
+
+/// `VICTORY_BVH_PREP_TOTAL_MB` (default 1024): bytes of copies the prep
+/// may number in all. (Unbounded, a run took 29.7 GB of private memory in
+/// the menus.)
+fn prep_total() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_BVH_PREP_TOTAL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
     })
 }
 
@@ -178,6 +191,7 @@ impl Memory {
             allocations: Default::default(),
             seen: HashMap::new(),
             missed: (0, 0, u64::MAX, 0),
+            prepped: 0,
         })
     }
 
@@ -346,30 +360,72 @@ impl Memory {
         }
     }
 
-    /// (`VICTORY_BVH_PREP=1`) Copies for the whole title allocation around
-    /// `address`, from the address's 4 MiB cell on, at most
-    /// `VICTORY_BVH_PREP_MB`.
+    /// (`VICTORY_BVH_PREP=1`) Copies for the title allocation around
+    /// `address`: all of it when it is at most `VICTORY_BVH_PREP_MB`
+    /// (default 256), else that much centred on the address. Each
+    /// allocation is asked of Windows once and remembered with the span
+    /// already made ready: an address inside it costs a map lookup, and
+    /// only cells outside the span are mapped. (It was the cell of the
+    /// address and on only: the builder's pointers into the title's big
+    /// block lay 400 MB below the address it was given, and each new
+    /// address asked again.)
     fn map_allocation(&mut self, address: u64) {
-        let cell = address & !(CELL - 1);
-        let Some((base, end)) = allocation(address) else { return };
-        if !self.allocations.insert(base.max(cell)) {
+        let known = self
+            .allocations
+            .range(..=address)
+            .next_back()
+            .filter(|(_, a)| address < a.0)
+            .map(|(&base, &a)| (base, a));
+        let (base, (end, lo, hi)) = match known {
+            Some(k) => k,
+            None => {
+                let Some((base, end)) = allocation(address) else { return };
+                (base, (end, address, address))
+            }
+        };
+        let half = prep_bytes() / 2;
+        let (want_lo, want_hi) = if end - base <= 2 * half {
+            (base, end)
+        } else {
+            let lo = address.saturating_sub(half).max(base);
+            (lo, (lo + 2 * half).min(end))
+        };
+        let want_lo = want_lo & !(CELL - 1);
+        let covered = lo < hi;
+        if covered && want_lo >= lo && want_hi <= hi {
             return;
         }
-        let end = end.min(cell.saturating_add(prep_bytes()));
-        let mut at = base.max(cell);
         let before = self.copies.len();
-        while at < end {
-            self.map(at);
-            at = (at & !(CELL - 1)) + CELL;
+        let mut at = want_lo;
+        while at < want_hi {
+            if self.prepped >= prep_total() {
+                static FULL: std::sync::Once = std::sync::Once::new();
+                FULL.call_once(|| {
+                    tracing::warn!(
+                        mb = self.prepped >> 20,
+                        "bvh prep: VICTORY_BVH_PREP_TOTAL_MB reached; further allocations are not made ready ahead (faulted pages still get copies)"
+                    )
+                });
+                break;
+            }
+            if !(covered && at >= lo && at + CELL <= hi) {
+                let n = self.copies.len();
+                self.map(at.max(base));
+                self.prepped += self.copies[n..].iter().map(|c| c.span().1).sum::<u64>();
+            }
+            at += CELL;
         }
+        let want_hi = want_hi.min(at);
+        let (lo, hi) = if covered { (lo.min(want_lo), hi.max(want_hi)) } else { (want_lo, want_hi) };
+        self.allocations.insert(base, (end, lo, hi));
         let made = self.copies.len() - before;
         if made > 0 {
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
                 tracing::info!(
-                    "bvh prep: allocation at {base:#x} ({:.1} MB from {:#x}) made ready, {made} copies more",
-                    (end - base.max(cell)) as f64 / 1e6,
-                    base.max(cell)
+                    "bvh prep: allocation at {base:#x} ({:.1} MB) ready from {lo:#x} to {hi:#x}, {made} copies more ({} numbered)",
+                    (end - base) as f64 / 1e6,
+                    self.copies.len()
                 );
             }
         }

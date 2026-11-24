@@ -2436,6 +2436,9 @@ fn relay_hand_back(back: &[Declared]) {
             written += shadow.relay_merge(at, n, &mut now, &mut title);
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        if shadow.by_address.load(Ordering::Relaxed) {
+            crate::shadow::BY_ADDRESS_BACK.fetch_add(written as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::compared(*from, to - from, written);
         let _ = (from, to);
