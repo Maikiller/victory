@@ -278,14 +278,27 @@ fn unspill(
     let mut stores = [false; 256];
     let mut other = [false; 256];
     let mut used = [false; 128];
+    // `VICTORY_UNSPILL_WHY=1`: what keeps a VGPR with parked scalars from
+    // being unspilled (its lanes then follow EXEC: a write to a lane outside
+    // it is lost, #62 of the fork), on stderr.
+    let why = std::env::var_os("VICTORY_UNSPILL_WHY").is_some_and(|v| v == "1");
+    let mut first_other: Vec<Option<(usize, String)>> = vec![None; 256];
     let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     for inst in list.iter() {
-        let Some(name) = inst.name() else { return Vec::new() };
+        let Some(name) = inst.name() else {
+            if why {
+                eprintln!("UNSPILL off: an undecoded instruction at {:#x}", inst.offset);
+            }
+            return Vec::new();
+        };
         let fields = inst.fields(wave64);
         let park = parked(inst, &fields);
         let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
+            if why {
+                eprintln!("UNSPILL off: effects unknown of {name} at {:#x}", inst.offset);
+            }
             return Vec::new();
         };
         let mut codes = Vec::new();
@@ -314,7 +327,12 @@ fn unspill(
                 match reg {
                     Reg::S(c) => used[usize::from(c)] = true,
                     Reg::V(r) if park.is_some_and(|p| p.1 == r) => stores[usize::from(r)] = true,
-                    Reg::V(r) => other[usize::from(r)] = true,
+                    Reg::V(r) => {
+                        other[usize::from(r)] = true;
+                        if why && first_other[usize::from(r)].is_none() {
+                            first_other[usize::from(r)] = Some((inst.offset, name.to_string()));
+                        }
+                    }
                     Reg::Scc => {}
                 }
             }
@@ -322,6 +340,17 @@ fn unspill(
         parks.push(park);
         written.push(codes);
         read.push(from);
+    }
+    if why {
+        let mut told = [false; 256];
+        for p in parks.iter().flatten() {
+            let r = usize::from(p.1);
+            if other[r] && !told[r] {
+                told[r] = true;
+                let (at, by) = first_other[r].clone().unwrap_or_default();
+                eprintln!("UNSPILL v{r} kept: also used by {by} at {at:#x} (lanes follow EXEC)");
+            }
+        }
     }
     for (i, park) in parks.iter_mut().enumerate() {
         if park.is_some_and(|p| other[usize::from(p.1)]) {
@@ -415,7 +444,12 @@ fn unspill(
     for &(reg, lane) in &pairs {
         let at = (108..123).chain((0..104).rev()).chain(past..254).find(|&c| free[c] && free[c + 1]);
         // Not enough spare codes: leave the program as it is.
-        let Some(c) = at else { return Vec::new() };
+        let Some(c) = at else {
+            if why {
+                eprintln!("UNSPILL off: no spare codes for {} parked pairs", pairs.len());
+            }
+            return Vec::new();
+        };
         (free[c], free[c + 1]) = (false, false);
         codes.push(((reg, lane), c as u8));
         codes.push(((reg, lane + 1), c as u8 + 1));
@@ -425,6 +459,9 @@ fn unspill(
             continue;
         }
         let Some(c) = (108..=123).chain((0..105).rev()).chain(past..255).find(|&c| free[c]) else {
+            if why {
+                eprintln!("UNSPILL off: no spare code for {} parked lanes", slots.len());
+            }
             return Vec::new();
         };
         free[c] = false;
