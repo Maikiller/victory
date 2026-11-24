@@ -84,8 +84,12 @@ struct Memory {
     /// Lost reads and lost stores (pages, as noted) since the last log,
     /// the first page and the frames counted.
     missed: (u64, u64, u64, u64),
-    /// Bytes of the copies the prep numbered.
+    /// Bytes of the copies the prep numbered for named addresses, and for
+    /// allocations shaders reached through pointers.
     prepped: u64,
+    prepped_reached: u64,
+    /// Frames in which shaders read title memory by address.
+    frames: u64,
 }
 
 /// `VICTORY_BVH_PREP=1`: before a dispatch that reads title memory by
@@ -127,6 +131,13 @@ fn prep_total() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("VICTORY_BVH_PREP_TOTAL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
+    })
+}
+
+fn prep_reached() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_BVH_PREP_REACHED_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096) << 20
     })
 }
 
@@ -192,6 +203,8 @@ impl Memory {
             seen: HashMap::new(),
             missed: (0, 0, u64::MAX, 0),
             prepped: 0,
+            prepped_reached: 0,
+            frames: 0,
         })
     }
 
@@ -313,7 +326,8 @@ impl Memory {
         // Every 64 frames: how much the shaders that read title memory by
         // address lost (a page counts once per frame, whatever the lanes).
         self.missed.3 += 1;
-        if self.missed.3 >= 64 {
+        self.frames += 1;
+        if self.frames == 1 || self.frames % 8 == 0 {
             let (reads, stores, first, frames) = self.missed;
             if reads + stores > 0 {
                 tracing::warn!(
@@ -348,6 +362,23 @@ impl Memory {
                     },
                 };
                 tracing::info!("bvh watch {va:#x}: {what}");
+                // The node's first 64 bytes: in the copy shaders write, and
+                // in title memory where the title's CPU reads them.
+                let hex = |b: &[u8]| b.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().unwrap_or([0; 4])))).collect::<Vec<_>>().join(" ");
+                if n != 0
+                    && let Some(c) = self.copies.get(n as usize - 1)
+                    && let Some(bytes) = c.host_bytes(va, 64)
+                {
+                    tracing::info!("bvh watch {va:#x} copy:  {}", hex(&bytes));
+                }
+                if crate::texture::committed(va as *const u8, 64) {
+                    let mut bytes = [0u8; 64];
+                    // SAFETY: committed title memory.
+                    unsafe { std::ptr::copy_nonoverlapping(va as *const u8, bytes.as_mut_ptr(), 64) };
+                    tracing::info!("bvh watch {va:#x} title: {}", hex(&bytes));
+                } else {
+                    tracing::info!("bvh watch {va:#x} title: not committed");
+                }
             }
             self.missed = (0, 0, u64::MAX, 0);
         }
@@ -355,7 +386,7 @@ impl Memory {
             let at = u64::from(page) * PAGE;
             self.map(at);
             if prep() {
-                self.map_allocation(at);
+                self.map_allocation(at, true);
             }
         }
     }
@@ -369,7 +400,12 @@ impl Memory {
     /// address and on only: the builder's pointers into the title's big
     /// block lay 400 MB below the address it was given, and each new
     /// address asked again.)
-    fn map_allocation(&mut self, address: u64) {
+    /// `reached`: a page shaders touched through a pointer (a fault): its
+    /// allocation is made ready whole, whatever its size (the structures'
+    /// allocations are 1.2 and 2.3 GB), within `VICTORY_BVH_PREP_REACHED_MB`
+    /// (default 4096) of its own; `VICTORY_BVH_PREP_TOTAL_MB` bounds the
+    /// others.
+    fn map_allocation(&mut self, address: u64, reached: bool) {
         let known = self
             .allocations
             .range(..=address)
@@ -384,7 +420,7 @@ impl Memory {
             }
         };
         let half = prep_bytes() / 2;
-        let (want_lo, want_hi) = if end - base <= 2 * half {
+        let (want_lo, want_hi) = if reached || end - base <= 2 * half {
             (base, end)
         } else {
             let lo = address.saturating_sub(half).max(base);
@@ -398,12 +434,18 @@ impl Memory {
         let before = self.copies.len();
         let mut at = want_lo;
         while at < want_hi {
-            if self.prepped >= prep_total() {
+            let (used, most) = if reached {
+                (self.prepped_reached, prep_reached())
+            } else {
+                (self.prepped, prep_total())
+            };
+            if used >= most {
                 static FULL: std::sync::Once = std::sync::Once::new();
                 FULL.call_once(|| {
                     tracing::warn!(
-                        mb = self.prepped >> 20,
-                        "bvh prep: VICTORY_BVH_PREP_TOTAL_MB reached; further allocations are not made ready ahead (faulted pages still get copies)"
+                        mb = used >> 20,
+                        reached,
+                        "bvh prep: its bound reached (VICTORY_BVH_PREP_TOTAL_MB for named addresses, _REACHED_MB for allocations reached through pointers); no more made ready ahead (faulted pages still get copies)"
                     )
                 });
                 break;
@@ -411,7 +453,12 @@ impl Memory {
             if !(covered && at >= lo && at + CELL <= hi) {
                 let n = self.copies.len();
                 self.map(at.max(base));
-                self.prepped += self.copies[n..].iter().map(|c| c.span().1).sum::<u64>();
+                let bytes = self.copies[n..].iter().map(|c| c.span().1).sum::<u64>();
+                if reached {
+                    self.prepped_reached += bytes;
+                } else {
+                    self.prepped += bytes;
+                }
             }
             at += CELL;
         }
@@ -437,7 +484,7 @@ impl Memory {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
         if prep() && !self.refused.contains(&(address / PAGE)) {
-            self.map_allocation(address);
+            self.map_allocation(address, false);
         }
     }
 }

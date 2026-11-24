@@ -2475,6 +2475,22 @@ impl Shadow {
 
     /// Whether shaders read and write this copy in the card's own memory
     /// ([`cards`]).
+    /// Up to `n` bytes of the copy at title address `address`, as the
+    /// PC's side holds them (in place: title memory itself). None for a
+    /// copy in the card's memory or an address outside the copy.
+    pub(crate) fn host_bytes(&self, address: u64, n: usize) -> Option<Vec<u8>> {
+        if self.card.is_some() {
+            return None;
+        }
+        let at = self.offset_in(address)?;
+        let n = n.min((self.len - at) as usize);
+        let mut out = vec![0u8; n];
+        // SAFETY: inside the copy's mapping (or, in place, the title's
+        // committed memory the copy is).
+        unsafe { std::ptr::copy_nonoverlapping(self.data.add(at as usize), out.as_mut_ptr(), n) };
+        Some(out)
+    }
+
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
     }
