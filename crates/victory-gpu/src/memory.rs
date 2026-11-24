@@ -75,6 +75,56 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// (`VICTORY_BVH_PREP=1`) Title allocations whose extent has been
+    /// mapped whole, by their first byte.
+    allocations: std::collections::HashSet<u64>,
+    /// (`VICTORY_BVH_PREP=1`) Per host list (by address): how many copies
+    /// were numbered when it last brought them up to date.
+    seen: HashMap<usize, usize>,
+    /// Lost reads and lost stores (pages, as noted) since the last log,
+    /// the first page and the frames counted.
+    missed: (u64, u64, u64, u64),
+}
+
+/// `VICTORY_BVH_PREP=1`: before a dispatch that reads title memory by
+/// address (the ray-tracing structure builder, the traces):
+/// - a named address or a faulted page gets the copies of the whole title
+///   allocation around it ([`allocation`], at most `VICTORY_BVH_PREP_MB`,
+///   default 256, from the address on), not only its 4 MiB: what a stage
+///   reaches through pointers it reads out of memory is mostly in the same
+///   allocation as what it was given;
+/// - every copy numbered since the list last brought them up to date
+///   (by another list too) is brought up to date before this dispatch,
+///   and, for a dispatch that writes, declared written (so its bytes go
+///   back to title memory after the list, where the title's CPU reads the
+///   nodes).
+fn prep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_PREP").is_some_and(|v| v == "1"))
+}
+
+fn prep_bytes() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_BVH_PREP_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+    })
+}
+
+/// The title allocation holding `address`: its first byte and the end of
+/// the run of pages in the address's state (one `VirtualQuery`; it walks
+/// the page tables, so it is asked once per allocation).
+fn allocation(address: u64) -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::Memory as mem;
+    // SAFETY: plain data filled in by the query.
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { mem::VirtualQuery(address as *const std::ffi::c_void, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != mem::MEM_COMMIT {
+        return None;
+    }
+    let base = info.AllocationBase as u64;
+    let end = info.BaseAddress as u64 + info.RegionSize as u64;
+    Some((base, end))
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -111,6 +161,9 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            allocations: Default::default(),
+            seen: HashMap::new(),
+            missed: (0, 0, u64::MAX, 0),
         })
     }
 
@@ -204,6 +257,14 @@ impl Memory {
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
             if page != 0 {
+                let store = page & victory_shader::emit::FAULT_STORE != 0;
+                let page = page & !victory_shader::emit::FAULT_STORE;
+                if store {
+                    self.missed.1 += 1;
+                } else {
+                    self.missed.0 += 1;
+                }
+                self.missed.2 = self.missed.2.min(u64::from(page) * PAGE);
                 pages.push(page);
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
@@ -220,8 +281,53 @@ impl Memory {
                 );
             }
         }
+        // Every 64 frames: how much the shaders that read title memory by
+        // address lost (a page counts once per frame, whatever the lanes).
+        self.missed.3 += 1;
+        if self.missed.3 >= 64 {
+            let (reads, stores, first, frames) = self.missed;
+            if reads + stores > 0 {
+                tracing::warn!(
+                    "bvh raw: {reads} reads/{stores} stores missed (pages without a copy, over {frames} frames), first at {first:#x}"
+                );
+            }
+            self.missed = (0, 0, u64::MAX, 0);
+        }
         for page in pages {
-            self.map(u64::from(page) * PAGE);
+            let at = u64::from(page) * PAGE;
+            self.map(at);
+            if prep() {
+                self.map_allocation(at);
+            }
+        }
+    }
+
+    /// (`VICTORY_BVH_PREP=1`) Copies for the whole title allocation around
+    /// `address`, from the address's 4 MiB cell on, at most
+    /// `VICTORY_BVH_PREP_MB`.
+    fn map_allocation(&mut self, address: u64) {
+        let cell = address & !(CELL - 1);
+        let Some((base, end)) = allocation(address) else { return };
+        if !self.allocations.insert(base.max(cell)) {
+            return;
+        }
+        let end = end.min(cell.saturating_add(prep_bytes()));
+        let mut at = base.max(cell);
+        let before = self.copies.len();
+        while at < end {
+            self.map(at);
+            at = (at & !(CELL - 1)) + CELL;
+        }
+        let made = self.copies.len() - before;
+        if made > 0 {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+                tracing::info!(
+                    "bvh prep: allocation at {base:#x} ({:.1} MB from {:#x}) made ready, {made} copies more",
+                    (end - base.max(cell)) as f64 / 1e6,
+                    base.max(cell)
+                );
+            }
         }
     }
 
@@ -230,6 +336,9 @@ impl Memory {
     fn name(&mut self, address: u64) {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
+        if prep() && !self.refused.contains(&(address / PAGE)) {
+            self.map_allocation(address);
+        }
     }
 }
 
@@ -298,14 +407,28 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
+    // With VICTORY_BVH_PREP=1, also the copies numbered (by any list) since
+    // this list last brought them up to date.
+    let list_key = std::ptr::from_ref(list) as usize;
+    let since = if prep() && !first_read {
+        m.seen.get(&list_key).copied().unwrap_or(numbered).min(numbered)
+    } else {
+        numbered
+    };
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
+        if first_read || n >= since {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        if writes && (first_write || n >= since) {
             shadow.gpu_writes(list, start, len);
         }
+    }
+    if prep() {
+        if m.seen.len() > 4096 {
+            m.seen.clear();
+        }
+        m.seen.insert(list_key, m.copies.len());
     }
     if first_read {
         list.keep(&m.directory.0);

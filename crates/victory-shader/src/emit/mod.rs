@@ -117,7 +117,7 @@ pub use lower::set_host_max_wave;
 pub use per_program::{deep_skips_allowed, for_program, wave64_retried};
 pub use rect::rect_list_gs;
 pub use shader::{
-    IMAGE_KINDS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS, SLOT_IMAGE,
+    FAULT_STORE, IMAGE_KINDS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS, SLOT_IMAGE,
     SLOT_MEMORY, SLOT_REMAP, SLOT_VIEW_WORDS, infer_image_2d, rt_miss,
     SLOT_REMAP_COUNT, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, USER_DATA_SPACE, USER_MEMORY_BASE,
     USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, set_view_heap_remap, view_heap_settings,
