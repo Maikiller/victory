@@ -37,6 +37,13 @@ pub const SLOT_IMAGE: u32 = 1 << 31;
 /// DXIL resource kind): 1D, 1D array, 2D, 2D array, 3D.
 pub const IMAGE_KINDS: &[(u32, u32)] = &[(2, 1), (3, 6), (4, 2), (5, 7), (8, 4)];
 
+/// `VICTORY_RT_MISS=1`: every ray-tracing node test misses
+/// (`Lower::bvh_miss`). Part of the shader cache's key.
+pub fn rt_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_RT_MISS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// `VICTORY_INFER_IMAGE_2D`: `1` (the default) takes a descriptor read only
 /// as data with no used-resource entry and eight dwords for a 2D texture;
 /// `0` takes the kind of the view in its slot at run time ([`SLOT_IMAGE`]).

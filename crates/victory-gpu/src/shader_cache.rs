@@ -81,6 +81,8 @@ fn build() -> &'static [u8; 32] {
                 bytes.push(u8::from(remap));
                 // And how a descriptor read only as data takes its kind.
                 bytes.push(u8::from(victory_shader::emit::infer_image_2d()));
+                // And whether ray-tracing node tests all miss.
+                bytes.push(u8::from(victory_shader::emit::rt_miss()));
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
