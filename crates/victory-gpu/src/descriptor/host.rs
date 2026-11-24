@@ -1857,6 +1857,20 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
     if stride == 0 {
         return None;
     }
+    let window = raw_window_of(offset, first, count, stride);
+    if window.is_none() {
+        // Left structured: a raw read of it gives zeros on NVIDIA past the
+        // first dword (upstream #704's measurements).
+        STRUCTURED_LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        once!(offset, first, count, stride, "a structured buffer view not on 16 bytes stays structured: raw reads of it read zeros on NVIDIA");
+    }
+    window
+}
+
+/// Structured buffer views [`raw_window`] could not make raw.
+pub(crate) static STRUCTURED_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn raw_window_of(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
     let start = first.checked_mul(u64::from(stride))?.checked_add(offset)?;
     let bytes = u64::from(count) * u64::from(stride);
     (start % 16 == 0 && bytes % 4 == 0)
